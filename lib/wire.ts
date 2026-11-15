@@ -1,36 +1,35 @@
-// The client wires, the one upstream wire, and the model field.
+// The two client wires, the one upstream wire, and the model field.
 //
-// The trial's client calls the entry as an OpenAI service (POST /v1/chat/completions) or an Anthropic
-// one (POST /v1/messages), with a JSON body or with server-sent events. The entry dials the grader's
-// gateway, an OpenAI-compatible endpoint, so every prompt goes upstream as a Chat Completions request
-// and the Anthropic path is translated both ways:
+// Clients reach this server as an OpenAI service (POST /v1/chat/completions) or as an Anthropic
+// one (POST /v1/messages), with a JSON body or with server-sent events. Upstream there is only
+// one wire: the gateway speaks Chat Completions, so an Anthropic request is translated into a
+// Chat Completions body on the way out and the gateway's answer is translated back on the way
+// in, while an OpenAI request passes through with only its model field replaced:
 //
-//   - the OpenAI path passes the client's body (with the dialled model's id) to the gateway and relays
-//     the gateway's JSON or SSE answer, with every `model` field set to the id this entry dialled;
-//   - the Anthropic path rewrites the request to Chat Completions (system prompt, image blocks, tool
-//     definitions, tool results and tool choice included) and rewrites the gateway's answer into a
-//     Messages object, or into the message_start / content_block_start / content_block_delta /
-//     content_block_stop / message_delta / message_stop event order, with the stop reason and the usage
-//     translated. Tool calls become tool_use blocks and input_json_delta events.
+//   - JSON answers are re-shaped field by field: content blocks, tool calls, stop reasons and
+//     usage all change vocabulary between the two APIs, and nothing else about the answer does.
+//   - Streams are rebuilt event by event on the Anthropic side (message_start, content_block_*,
+//     message_delta, message_stop, with input_json_delta carrying tool arguments), and relayed
+//     frame by frame on the OpenAI side.
 //
 // THE MODEL FIELD
-//   The house records every gateway call and scores the model that really answered, so a response's
-//   `model` must be the model this entry dialled. OpenRouter's own answer names a free model without
-//   the gateway's `openrouter/` prefix; these functions put the dialled id back on every answer and
-//   every streamed chunk. They never make a model up: the id came from the brief and went to the
-//   gateway in the request's `model`.
+//   The house scores the model its gateway record shows really answered, so every `model` field
+//   this module emits names the id the server dialled. A provider's own answer spells a free
+//   model without the gateway's `openrouter/` prefix; the functions here put the dialled id
+//   back — on the JSON answer, on every streamed chunk, and on the Anthropic message — and they
+//   never invent an id: it came from the brief and went upstream in the request.
 //
 // USAGE
-//   The wire checks want a whole usage count: an input of at least 0 and an output of at least 1.
-//   Providers report usage on the answer (and, when asked with include_usage, on a stream's last
-//   chunk); that reported usage is relayed untouched. When a provider answers with text but reports
-//   no output tokens at all, the count falls back to a rough estimate from the text it did send —
-//   an estimate of the relay's own traffic, never a change to the answer's words.
+//   A valid answer carries a whole usage count: input tokens of at least 0, output of at least
+//   1. Provider-reported usage is relayed untouched, including the final usage chunk of a
+//   stream that was asked for one. When a provider sends text but reports no output tokens at
+//   all, the count falls back to a rough estimate from the text it did send — an accounting of
+//   the relay's own traffic, never a change to the answer's words.
 //
-// Everything here is a pure function of its arguments, except the stream relays: no clock and no
-// randomness, so the same body and the same gateway answer give the same bytes on a replay. The two
-// model listings use fixed timestamps for the same reason: a `created` that moved between runs would be
-// a nondeterministic document.
+// DETERMINISM
+//   Apart from the stream relays, everything here is a pure function of its arguments: no clock,
+//   no randomness. The model listings pin fixed timestamps for the same reason — a `created`
+//   that moved between a live pass and its replay would make the export differ.
 
 import { isRecord, type Json } from './providers.ts';
 
@@ -72,15 +71,18 @@ export function openAIError(message: string, type: string, code: string | null):
   return { error: { message, type, code } };
 }
 
-/** The text of a string or of a block array's text blocks; '' when there is none. */
-function textOf(content: unknown): string {
+/** The plain text of a content value: the string itself, or a block array's text blocks joined by newlines. */
+function plainTextOf(content: unknown): string {
   if (typeof content === 'string') return content;
   if (!Array.isArray(content)) return '';
   return content.flatMap((b) => (isRecord(b) && b.type === 'text' && typeof b.text === 'string' ? [b.text] : [])).join('\n');
 }
 
-/** One Anthropic content block as an OpenAI content part: text or an inline image; null for the rest. */
-function partOf(block: Json): Json | null {
+/**
+ * One Anthropic content block as an OpenAI content part: a text block stays text, an image block
+ * becomes an image_url part (a data URL for base64 sources), and anything else has no part.
+ */
+function toContentPart(block: Json): Json | null {
   if (block.type === 'text' && typeof block.text === 'string') return { type: 'text', text: block.text };
   if (block.type === 'image' && isRecord(block.source)) {
     const source = block.source;
@@ -93,25 +95,25 @@ function partOf(block: Json): Json | null {
   return null;
 }
 
-/** A tool_result block's content as text: its text blocks, or its JSON when it holds something else. */
-function toolResultText(content: unknown): string {
+/** A tool_result block's content flattened to text: its text blocks, or its JSON when it holds anything else. */
+function toolResultAsText(content: unknown): string {
   if (typeof content === 'string') return content;
   if (Array.isArray(content)) {
-    const text = textOf(content);
+    const text = plainTextOf(content);
     return text !== '' ? text : JSON.stringify(content);
   }
   return content === undefined ? '' : JSON.stringify(content);
 }
 
-/** A tool call's arguments as an object: the gateway's JSON string, or {} when it is not one. */
-function argumentsOf(value: unknown): Json {
+/** A tool call's arguments as an object: the gateway's JSON string parsed, or {} when it is not an object. */
+function parseToolArguments(value: unknown): Json {
   if (isRecord(value)) return value;
   if (typeof value === 'string' && value.trim() !== '') {
     try {
       const parsed: unknown = JSON.parse(value);
       if (isRecord(parsed)) return parsed;
     } catch {
-      // Not JSON: an empty input.
+      // Not JSON at all: the call carries an empty input.
     }
   }
   return {};
@@ -133,7 +135,7 @@ export function stopReasonOf(finish: unknown): string {
  */
 export function anthropicToOpenAI(body: Json, model: string): Json {
   const messages: Json[] = [];
-  const system = textOf(body.system);
+  const system = plainTextOf(body.system);
   if (system !== '') messages.push({ role: 'system', content: system });
   const source = Array.isArray(body.messages) ? body.messages : [];
   for (const raw of source) {
@@ -158,7 +160,7 @@ export function anthropicToOpenAI(body: Json, model: string): Json {
           },
         });
       }
-      const text = textOf(content);
+      const text = plainTextOf(content);
       messages.push({
         role: 'assistant',
         content: text !== '' ? text : null,
@@ -173,11 +175,11 @@ export function anthropicToOpenAI(body: Json, model: string): Json {
         messages.push({
           role: 'tool',
           tool_call_id: typeof block.tool_use_id === 'string' ? block.tool_use_id : '',
-          content: toolResultText(block.content),
+          content: toolResultAsText(block.content),
         });
         continue;
       }
-      const part = partOf(block);
+      const part = toContentPart(block);
       if (part !== null) parts.push(part);
     }
     if (parts.length > 0) messages.push({ role: 'user', content: parts });
@@ -217,12 +219,13 @@ export function anthropicToOpenAI(body: Json, model: string): Json {
   return out;
 }
 
-function numberOrZero(value: unknown): number {
+/** A value as a token count: itself when it is a finite number, else 0. */
+function finiteOrZero(value: unknown): number {
   return typeof value === 'number' && Number.isFinite(value) ? value : 0;
 }
 
-/** A rough token count for text a provider sent but did not meter: about four characters a token. */
-function estimateTokens(text: string): number {
+/** A rough token count for text a provider sent but did not meter: about four characters to a token, at least 1. */
+function roughTokenCount(text: string): number {
   return text === '' ? 0 : Math.max(1, Math.ceil(text.length / 4));
 }
 
@@ -232,7 +235,7 @@ export function openAIToAnthropic(body: Json, model: string): Json {
   const choice = isRecord(choices[0]) ? choices[0] : {};
   const message = isRecord(choice.message) ? choice.message : {};
   const content: Json[] = [];
-  const text = typeof message.content === 'string' ? message.content : textOf(message.content);
+  const text = typeof message.content === 'string' ? message.content : plainTextOf(message.content);
   if (text !== '') content.push({ type: 'text', text });
   const calls = Array.isArray(message.tool_calls) ? message.tool_calls : [];
   for (const call of calls) {
@@ -241,12 +244,12 @@ export function openAIToAnthropic(body: Json, model: string): Json {
       type: 'tool_use',
       id: typeof call.id === 'string' ? call.id : 'toolu_unknown',
       name: typeof call.function.name === 'string' ? call.function.name : '',
-      input: argumentsOf(call.function.arguments),
+      input: parseToolArguments(call.function.arguments),
     });
   }
   if (content.length === 0) content.push({ type: 'text', text: '' });
   const usage = isRecord(body.usage) ? body.usage : {};
-  const reportedOut = numberOrZero(usage.completion_tokens);
+  const reportedOut = finiteOrZero(usage.completion_tokens);
   return {
     id: `msg_${typeof body.id === 'string' ? body.id : 'aggregate'}`,
     type: 'message',
@@ -256,8 +259,8 @@ export function openAIToAnthropic(body: Json, model: string): Json {
     stop_reason: stopReasonOf(choice.finish_reason),
     stop_sequence: null,
     usage: {
-      input_tokens: numberOrZero(usage.prompt_tokens),
-      output_tokens: reportedOut > 0 ? reportedOut : estimateTokens(text),
+      input_tokens: finiteOrZero(usage.prompt_tokens),
+      output_tokens: reportedOut > 0 ? reportedOut : roughTokenCount(text),
     },
   };
 }
@@ -277,7 +280,7 @@ export function sseEvent(event: string | null, data: unknown): string {
  * `event:` lines and payloads that are not JSON objects pass through untouched. Chat Completions names
  * the model on its chunks; the client sees the id the entry dialled, never the provider's spelling.
  */
-function frameWithModel(frame: string, model: string): string {
+function frameWithDialledModel(frame: string, model: string): string {
   const lines = frame.split('\n').map((line) => {
     const trimmed = line.trim();
     if (!trimmed.startsWith('data:')) return line;
@@ -312,12 +315,12 @@ export async function* openAIStreamWithModel(upstream: ReadableStream<Uint8Array
       while (at !== -1) {
         const frame = buffer.slice(0, at);
         buffer = buffer.slice(at + 2);
-        yield frameWithModel(frame, model);
+        yield frameWithDialledModel(frame, model);
         at = buffer.indexOf('\n\n');
       }
     }
     buffer += decoder.decode();
-    if (buffer.trim() !== '') yield frameWithModel(buffer, model);
+    if (buffer.trim() !== '') yield frameWithDialledModel(buffer, model);
   } finally {
     reader.releaseLock();
   }
@@ -404,8 +407,8 @@ export async function* anthropicEventsFromOpenAI(upstream: ReadableStream<Uint8A
       }
       if (!isRecord(chunk)) continue;
       if (isRecord(chunk.usage)) {
-        inputTokens = numberOrZero(chunk.usage.prompt_tokens);
-        outputTokens = numberOrZero(chunk.usage.completion_tokens);
+        inputTokens = finiteOrZero(chunk.usage.prompt_tokens);
+        outputTokens = finiteOrZero(chunk.usage.completion_tokens);
       }
       const choices = Array.isArray(chunk.choices) ? chunk.choices : [];
       const choice = isRecord(choices[0]) ? choices[0] : null;
