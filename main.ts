@@ -15,10 +15,10 @@
 //     failover column can see a recovered refusal. Calls that met an upstream error do not count
 //     toward the tie-break, so failing over is free there; the caps below exist for the client's
 //     30-second patience and the trial's 60-call ceiling, not for the tie-break.
-//   cooldowns: a model that refuses takes a strike, and a struck model sorts below every
-//     never-refused model for the rest of the trial. One model's rate limit must not tax every
-//     later prompt: with fourteen models and six prompts, the small rating gap to the next clean
-//     model is cheap insurance against a capped model refusing all day.
+//   cooldowns: a model that refuses sits out the next prompt, then returns to its rating place.
+//     One prompt is long enough for a per-minute limit to clear; if the refusal was a daily cap,
+//     the model refuses once more, cheaply, and the prompt fails over exactly as it would have —
+//     while a model struck for the whole trial would tax every later prompt with the rating gap.
 //   served (15%) / wire (10%): the client body passes to the gateway whole (system prompt, tools,
 //     JSON mode, temperature), with two guarantees added: a model id from the brief, and an
 //     output cap on every call — the gateway refuses an uncapped request, so a body that names
@@ -29,7 +29,7 @@
 //
 // DETERMINISM
 //   Every choice derives from the brief, the requests, and the gateway's answers seen so far
-//   (strikes are a function of past refusals, never of the wall clock), so a replay that serves
+//   (cooldowns are a function of past refusals, never of the wall clock), so a replay that serves
 //   the recorded answers back walks the same route and leaves the same export.
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
@@ -88,8 +88,16 @@ const brief = readBrief(PROMPT_FILE);
 const catalog: CatalogReport = buildCatalog(brief);
 /** Which prompt row the request now arriving is: the brief's prompts are in the client's arrival order. */
 let manifestIndex = 0;
-/** Refusals per model this trial, in the order the gateway answered: the cooldown state. */
-const strikes = new Map<string, number>();
+/** Refusals per model this trial: the ordering state among models that have refused. */
+const refusals = new Map<string, number>();
+/**
+ * The arrival index from which a refused model is dialled first-choice again. A refusal at
+ * arrival i sets it to i + 2: the model sits out exactly one prompt, then returns to its rating
+ * place. A per-minute limit has cleared by then; a daily cap simply refuses again, cheaply,
+ * and the prompt fails over as it would have anyway. Arrival counts and past answers are all
+ * this reads — never the wall clock — so a replay walks the same route.
+ */
+const eligibleFrom = new Map<string, number>();
 /** Each free model's place in the brief, the final tie-break of the route order. */
 const briefOrder = new Map<string, number>(freeModels(brief).map((m, i) => [m.id, i]));
 
@@ -120,19 +128,25 @@ function servedModels(): ServedModel[] {
 
 /**
  * The candidates for one prompt, in the order this entry dials them: models that meet the
- * requirements, never-refused models first, then by the brief's rating, highest first, then by
- * brief order. A struck model is not excluded — if every clean model is spent it is still dialled,
- * last — but it never taxes a prompt ahead of a clean one again.
+ * requirements and are not sitting out a cooldown, by the brief's rating, highest first, then
+ * by brief order — then, as a fallback that keeps a prompt servable, the cooling models in the
+ * same order. A cooling model is dialled only when no eligible model meets the prompt.
  */
-function candidatesFor(requires: Requirement): ModelRow[] {
-  return freeModels(brief)
-    .filter((model) => meetsRequirements(requires, capabilitiesOf(model)))
-    .sort(
-      (a, b) =>
-        (strikes.get(a.id) ?? 0) - (strikes.get(b.id) ?? 0) ||
-        b.rating_milli - a.rating_milli ||
-        (briefOrder.get(a.id) ?? 0) - (briefOrder.get(b.id) ?? 0),
-    );
+function candidatesFor(requires: Requirement, arrival: number): ModelRow[] {
+  const byRank = (a: ModelRow, b: ModelRow): number =>
+    b.rating_milli - a.rating_milli ||
+    (refusals.get(a.id) ?? 0) - (refusals.get(b.id) ?? 0) ||
+    (briefOrder.get(a.id) ?? 0) - (briefOrder.get(b.id) ?? 0);
+  const meeting = freeModels(brief).filter((model) => meetsRequirements(requires, capabilitiesOf(model)));
+  const eligible = meeting.filter((model) => (eligibleFrom.get(model.id) ?? 0) <= arrival).sort(byRank);
+  const cooling = meeting.filter((model) => (eligibleFrom.get(model.id) ?? 0) > arrival).sort(byRank);
+  return [...eligible, ...cooling];
+}
+
+/** Strike a model for a refusal at this arrival: it sits out the next prompt, then returns. */
+function noteRefusal(model: string, arrival: number): void {
+  refusals.set(model, (refusals.get(model) ?? 0) + 1);
+  eligibleFrom.set(model, arrival + 2);
 }
 
 /** The requirements of the prompt now arriving: the brief's row by arrival order, unioned with the body's. */
@@ -254,12 +268,12 @@ interface GaveUp {
  * the prompt (no key was pushed — every candidate would refuse identically). Every refusal is
  * struck against its model and appended to the trail the answer reports.
  */
-async function dialWithFailover(requires: Requirement, build: (model: string) => Json, streaming: boolean): Promise<Served | GaveUp> {
+async function dialWithFailover(requires: Requirement, build: (model: string) => Json, streaming: boolean, arrival: number): Promise<Served | GaveUp> {
   const trail: Refusal[] = [];
   let lastStatus = 502;
   let lastText = 'no free model in the brief meets this request';
   let dials = 0;
-  for (const candidate of candidatesFor(requires)) {
+  for (const candidate of candidatesFor(requires, arrival)) {
     let retried = false;
     while (dials < MAX_DIALS_PER_PROMPT) {
       dials += 1;
@@ -277,7 +291,7 @@ async function dialWithFailover(requires: Requirement, build: (model: string) =>
         });
       } catch (err) {
         trail.push({ status: 502, code: 'upstream_unreachable', model: candidate.id });
-        strikes.set(candidate.id, (strikes.get(candidate.id) ?? 0) + 1);
+        noteRefusal(candidate.id, arrival);
         lastStatus = 502;
         lastText = (err as Error).message;
         if (!retried) {
@@ -290,7 +304,7 @@ async function dialWithFailover(requires: Requirement, build: (model: string) =>
       const text = await upstream.text().catch(() => '');
       const status = upstream.status;
       trail.push({ status, code: refusalCode(text, status), model: candidate.id });
-      strikes.set(candidate.id, (strikes.get(candidate.id) ?? 0) + 1);
+      noteRefusal(candidate.id, arrival);
       lastStatus = status;
       lastText = text;
       if (status === 401) return { upstream: null, trail, lastStatus, lastText };
@@ -317,10 +331,12 @@ async function chat(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const body = await readJson(req);
   if (body === null) return sendError(res, 'openai', 400, 'invalid_request_error', 'the request body is not one JSON object');
   const streaming = body.stream === true;
+  const arrival = manifestIndex;
   const outcome = await dialWithFailover(
     requirementsFor(body),
     (model) => (streaming ? { ...body, model, stream_options: { include_usage: true } } : { ...body, model }),
     streaming,
+    arrival,
   );
   if (outcome.upstream === null) return gaveUp(res, 'openai', outcome);
   const { upstream, model, trail } = outcome;
@@ -342,7 +358,8 @@ async function messages(req: IncomingMessage, res: ServerResponse): Promise<void
   const body = await readJson(req);
   if (body === null) return sendError(res, 'anthropic', 400, 'invalid_request_error', 'the request body is not one JSON object');
   const streaming = body.stream === true;
-  const outcome = await dialWithFailover(requirementsFor(body), (model) => anthropicToOpenAI(body, model), streaming);
+  const arrival = manifestIndex;
+  const outcome = await dialWithFailover(requirementsFor(body), (model) => anthropicToOpenAI(body, model), streaming, arrival);
   if (outcome.upstream === null) return gaveUp(res, 'anthropic', outcome);
   const { upstream, model, trail } = outcome;
   if (streaming) {
